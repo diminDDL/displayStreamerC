@@ -23,6 +23,10 @@
 
 using namespace cv;
 
+// threading
+#include <thread>
+#include <mutex>
+
 
 #include <stdio.h>
 #define GL_SILENCE_DEPRECATION
@@ -69,37 +73,47 @@ void ImageFromDisplay(std::vector<uint8_t>& Pixels, int& Width, int& Height, int
     XCloseDisplay(display);
 }
 
-// Main code
-int main(int, char**)
-{
+// we use an interleaved frame buffer
+Mat img1;                   // the first frame buffer
+std::mutex scFbMutex;       // mutex for the frame buffer  
+void takeScreenshot(){
+    
+    int Width = 0;
+    int Height = 0;
+    int Bpp = 0;
+    std::vector<std::uint8_t> Pixels;
+    Mat buff;
+    while(true){
+
+    ImageFromDisplay(Pixels, Width, Height, Bpp);
+    buff = Mat(Height, Width, Bpp > 24 ? CV_8UC4 : CV_8UC3, &Pixels[0]);
+    // get the current frame buffer
+    scFbMutex.lock();
+    img1 = buff.clone();
+    scFbMutex.unlock();
+    // std::cout << "Screenshot taken" << std::endl;
+
+    // wait for 1 second
+    // std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    }
+}
+
+// GUI thread
+GLuint textureID = 0;
+void guiThread(){
+
+    Mat img;
 
 
-/////////////////////////  OPENCV SCREENSHOT  /////////////////////////
     int Width = 0;
     int Height = 0;
     int Bpp = 0;
     std::vector<std::uint8_t> Pixels;
 
-    ImageFromDisplay(Pixels, Width, Height, Bpp);
-
-    Mat img1 = Mat(Height, Width, Bpp > 24 ? CV_8UC4 : CV_8UC3, &Pixels[0]); //Mat(Size(Height, Width), Bpp > 24 ? CV_8UC4 : CV_8UC3, &Pixels[0]); 
-    // namedWindow("WindowTitle", WINDOW_AUTOSIZE);
-    // imshow("Display window", img1);
-    // waitKey(0);
-    
-    Mat img;
-    cv::cvtColor(img1, img, cv::COLOR_BGR2RGB);
-    // create a texture
-    GLuint textureID = 0;
-    glGenTextures(1, &textureID);
-    glBindTexture(GL_TEXTURE_2D, textureID);
-
-    //return 0;
-/////////////////////////  OPENCV SCREENSHOT END  /////////////////////////
-
     glfwSetErrorCallback(glfw_error_callback);
     if (!glfwInit())
-        return 1;
+        return;
 
     // Decide GL+GLSL versions
 #if defined(IMGUI_IMPL_OPENGL_ES2)
@@ -127,7 +141,7 @@ int main(int, char**)
     // Create window with graphics context
     GLFWwindow* window = glfwCreateWindow(1280, 720, "Dear ImGui GLFW+OpenGL3 example", NULL, NULL);
     if (window == NULL)
-        return 1;
+        return;
     glfwMakeContextCurrent(window);
     glfwSwapInterval(0); // Enable vsync
 
@@ -192,23 +206,26 @@ int main(int, char**)
         ImGui::SameLine();
         ImGui::Text("counter = %d", counter);
         ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / io.Framerate, io.Framerate);
-        // convert the opencv img to a texture and display it in imgui
+
+
+        // ImageFromDisplay(Pixels, Width, Height, Bpp);
+        // img1 = Mat(Height, Width, Bpp > 24 ? CV_8UC4 : CV_8UC3, &Pixels[0]);
         
-        ImageFromDisplay(Pixels, Width, Height, Bpp);
-
-        img1 = Mat(Height, Width, Bpp > 24 ? CV_8UC4 : CV_8UC3, &Pixels[0]); //Mat(Size(Height, Width), Bpp > 24 ? CV_8UC4 : CV_8UC3, &Pixels[0]); 
-        // namedWindow("WindowTitle", WINDOW_AUTOSIZE);
-        // imshow("Display window", img1);
-        // waitKey(0);
-        cv::cvtColor(img1, img, cv::COLOR_BGR2RGB);
-
+        scFbMutex.lock();
+        img = img1.clone();
+        scFbMutex.unlock();
+        cvtColor(img, img, cv::COLOR_BGR2RGB);
+        // std::cout << "img1: " << img1.cols << "x" << img1.rows << std::endl;
+        ImGui::Text("img: %dx%d", img.cols, img.rows);
+        ImGui::Text("average pixel color: %f", mean(img)[0]);
         //glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, img.cols, img.rows, 0, GL_RGB, GL_UNSIGNED_BYTE, img.ptr());
-        ImGui::Image((void*)(intptr_t)textureID, ImVec2(200, 200));
+        ImGui::Image((void*)(intptr_t)textureID, ImVec2(960, 540));
+        //ImGui::Image((void*)(intptr_t)textureID, ImVec2(192, 108));
         ImGui::End();
         
 
@@ -236,7 +253,7 @@ int main(int, char**)
         glfwSwapBuffers(window);
 
         // wait 10ms blocking
-        // std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        // std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 #ifdef __EMSCRIPTEN__
     EMSCRIPTEN_MAINLOOP_END;
@@ -250,6 +267,48 @@ int main(int, char**)
     glfwDestroyWindow(window);
     glfwTerminate();
 
-    return 0;
+    return;
+}
+
+
+
+
+int main(int, char**)
+{
+
+
+/////////////////////////  OPENCV SCREENSHOT  /////////////////////////
+    int Width = 0;
+    int Height = 0;
+    int Bpp = 0;
+    std::vector<std::uint8_t> Pixels;
+
+    ImageFromDisplay(Pixels, Width, Height, Bpp);
+
+    img1 = Mat(Height, Width, Bpp > 24 ? CV_8UC4 : CV_8UC3, &Pixels[0]); //Mat(Size(Height, Width), Bpp > 24 ? CV_8UC4 : CV_8UC3, &Pixels[0]); 
+    // namedWindow("WindowTitle", WINDOW_AUTOSIZE);
+    // imshow("Display window", img1);
+    // waitKey(0);
+
+    // cv::cvtColor(img1, img, cv::COLOR_BGR2RGB);
+    // // create a texture
+
+    
+    glGenTextures(1, &textureID);
+    glBindTexture(GL_TEXTURE_2D, textureID);
+
+    //return 0;
+/////////////////////////  OPENCV SCREENSHOT END  /////////////////////////
+
+    // start the screenshot thread
+    std::thread screenshotThread(takeScreenshot);
+
+    // start the imgui thread
+    std::thread imguiThread(guiThread);
+
+    // wait for the threads to finish
+    // screenshotThread.join();
+    imguiThread.join();
+
 }
 

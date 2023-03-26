@@ -40,6 +40,8 @@ using namespace cv;
 // Your own project should not be affected, as you are likely to link with a newer binary of GLFW that is adequate for your version of Visual Studio.
 #if defined(_MSC_VER) && (_MSC_VER >= 1900) && !defined(IMGUI_DISABLE_WIN32_FUNCTIONS)
 #pragma comment(lib, "legacy_stdio_definitions")
+#include <Windows.h>
+#define WIN_ENABLED
 #endif
 
 // This example can also compile and run with Emscripten! See 'Makefile.emscripten' for details.
@@ -52,6 +54,33 @@ static void glfw_error_callback(int error, const char* description)
     fprintf(stderr, "GLFW Error %d: %s\n", error, description);
 }
 
+#ifdef WIN_ENABLED
+void ImageFromDisplay(std::vector<uint8_t>& Pixels, int& Width, int& Height, int& BitsPerPixel)
+{
+    HWND hDesktop = GetDesktopWindow();
+    HDC hDC = GetDC(hDesktop);
+    HDC hMemDC = CreateCompatibleDC(hDC);
+    HBITMAP hBitmap = CreateCompatibleBitmap(hDC, Width, Height);
+    SelectObject(hMemDC, hBitmap);
+    BitBlt(hMemDC, 0, 0, Width, Height, hDC, 0, 0, SRCCOPY);
+    BITMAPINFOHEADER bi;
+    bi.biSize = sizeof(BITMAPINFOHEADER);
+    bi.biWidth = Width;
+    bi.biHeight = -Height;
+    bi.biPlanes = 1;
+    bi.biBitCount = 32;
+    bi.biCompression = BI_RGB;
+    bi.biSizeImage = 0;
+    bi.biXPelsPerMeter = 0;
+    bi.biYPelsPerMeter = 0;
+    bi.biClrUsed = 0;
+    bi.biClrImportant = 0;
+    GetDIBits(hDC, hBitmap, 0, Height, &Pixels[0], (BITMAPINFO*)&bi, DIB_RGB_COLORS);
+    DeleteObject(hBitmap);
+    DeleteDC(hMemDC);
+    ReleaseDC(hDesktop, hDC);
+}
+#else
 void ImageFromDisplay(std::vector<uint8_t>& Pixels, int& Width, int& Height, int& BitsPerPixel)
 {
     Display* display = XOpenDisplay(nullptr);
@@ -72,10 +101,18 @@ void ImageFromDisplay(std::vector<uint8_t>& Pixels, int& Width, int& Height, int
     XDestroyImage(img);
     XCloseDisplay(display);
 }
+#endif
 
 // we use an interleaved frame buffer
 Mat img1;                   // the first frame buffer
+bool changeFb = false;      // flag to indicate that the frame buffer has changed
 std::mutex scFbMutex;       // mutex for the frame buffer  
+std::mutex scDtMutex;       // mutex for the time between two screenshots
+std::mutex scFbChangeMutex; // mutex for the flag changeFb
+std::mutex gtFrMutex;       // mutex for the frame rate
+float frameRate = 0.0;      // the target frame rate    
+double deltaScTime = 0.0;   // time between two screenshots
+
 void takeScreenshot(){
     
     int Width = 0;
@@ -84,18 +121,38 @@ void takeScreenshot(){
     std::vector<std::uint8_t> Pixels;
     Mat buff;
     while(true){
+    auto start = std::chrono::system_clock::now();
 
     ImageFromDisplay(Pixels, Width, Height, Bpp);
     buff = Mat(Height, Width, Bpp > 24 ? CV_8UC4 : CV_8UC3, &Pixels[0]);
-    // get the current frame buffer
+    
+    scFbChangeMutex.lock();
+    changeFb = true;
+    scFbChangeMutex.unlock();
+
     scFbMutex.lock();
     img1 = buff.clone();
     scFbMutex.unlock();
     // std::cout << "Screenshot taken" << std::endl;
 
     // wait for 1 second
-    // std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // calculate the time between two screenshots in miliseconds
 
+    auto end = std::chrono::system_clock::now();
+    std::chrono::duration<double> elapsed_seconds = end-start;
+    gtFrMutex.lock();
+    // calculate the required delay for to hit the target frame rate
+    float delay = 1000.0 / frameRate - elapsed_seconds.count() * 1000;
+    gtFrMutex.unlock();
+    if(delay > 0){
+        std::this_thread::sleep_for(std::chrono::milliseconds((int)delay));
+    }
+    end = std::chrono::system_clock::now();
+    elapsed_seconds = end-start;
+    scDtMutex.lock();
+    deltaScTime = elapsed_seconds.count() * 1000;
+    scDtMutex.unlock();
     }
 }
 
@@ -105,10 +162,9 @@ void guiThread(){
 
     Mat img;
 
+    // a FIFO with the last 250 frametimes
+    std::deque<double> frametimes;
 
-    int Width = 0;
-    int Height = 0;
-    int Bpp = 0;
     std::vector<std::uint8_t> Pixels;
 
     glfwSetErrorCallback(glfw_error_callback);
@@ -143,7 +199,7 @@ void guiThread(){
     if (window == NULL)
         return;
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(0); // Enable vsync
+    glfwSwapInterval(1); // Enable vsync
 
     // Setup Dear ImGui context
     IMGUI_CHECKVERSION();
@@ -160,7 +216,7 @@ void guiThread(){
     ImGui_ImplOpenGL3_Init(glsl_version);
     glewInit();
     // Our state
-    bool show_demo_window = true;
+    bool show_demo_window = false;
     bool show_another_window = false;
     ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
 
@@ -192,38 +248,71 @@ void guiThread(){
 
         // 2. Show a simple window that we create ourselves. We use a Begin/End pair to create a named window.
         
-        static float f = 0.0f;
-        static int counter = 0;
+        // static float f = 0.0f;
+        // static int counter = 0;
     
-        ImGui::Begin("Hello, world!");                          // Create a window called "Hello, world!" and append into it.
-        ImGui::Text("This is some useful text.");               // Display some text (you can use a format strings too)
+        ImGui::Begin("EL STREAMER");                          // Create a window called "Hello, world!" and append into it.
+        ImGui::Text("Welcome to EL Streamer");               // Display some text (you can use a format strings too)
         ImGui::Checkbox("Demo Window", &show_demo_window);      // Edit bools storing our window open/close state
-        ImGui::Checkbox("Another Window", &show_another_window);
-        ImGui::SliderFloat("float", &f, 0.0f, 1.0f);            // Edit 1 float using a slider from 0.0f to 1.0f
+        // ImGui::Checkbox("Another Window", &show_another_window);
+        // ImGui::SliderFloat("float", &f, 0.0f, 1.0f);            // Edit 1 float using a slider from 0.0f to 1.0f
         ImGui::ColorEdit3("clear color", (float*)&clear_color); // Edit 3 floats representing a color
-        if (ImGui::Button("Button"))                            // Buttons return true when clicked (most widgets return true when edited/activated)
-            counter++;
-        ImGui::SameLine();
-        ImGui::Text("counter = %d", counter);
-        ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / io.Framerate, io.Framerate);
+        // if (ImGui::Button("Button"))                            // Buttons return true when clicked (most widgets return true when edited/activated)
+        //     counter++;
+        // ImGui::SameLine();
+        // ImGui::Text("counter = %d", counter);
+        float frameTime = 1000.0f / io.Framerate;
+        gtFrMutex.lock();
+        frameRate = io.Framerate;
+        gtFrMutex.unlock();
+        // add frame time to the vector and if it's too big, remove the first element
+        frametimes.push_back(frameTime);
+        if (frametimes.size() > 250) {
+            frametimes.erase(frametimes.begin());
+        }
+        float arrFrameTimes[250] = {0};
+        for (long unsigned int i = 0; i < frametimes.size(); i++) {
+            arrFrameTimes[i] = frametimes[i];
+        }
+        float maxFrameTime = 17;
+        for (long unsigned int i = 0; i < frametimes.size(); i++) {
+            if (frametimes[i] > maxFrameTime) {
+                maxFrameTime = frametimes[i];
+            }
+        }
+        double scTime = 0;
+        scDtMutex.lock();
+        scTime = deltaScTime;
+        scDtMutex.unlock();
+        ImGui::Text("Application average %.3f ms/frame (%.1f FPS); Screenshot thread: %.3f ms/frame", frameTime, io.Framerate, scTime);
+        ImGui::PlotLines("Frame Times", arrFrameTimes, IM_ARRAYSIZE(arrFrameTimes), 0, NULL, 0, maxFrameTime, ImVec2(0, 80));
 
+        
 
         // ImageFromDisplay(Pixels, Width, Height, Bpp);
         // img1 = Mat(Height, Width, Bpp > 24 ? CV_8UC4 : CV_8UC3, &Pixels[0]);
         
+        bool bufferChanged = false;
+        scFbChangeMutex.lock();
+        bufferChanged = changeFb;
+        changeFb = false;
+        scFbChangeMutex.unlock();
+
+        if(bufferChanged){
         scFbMutex.lock();
         img = img1.clone();
         scFbMutex.unlock();
         cvtColor(img, img, cv::COLOR_BGR2RGB);
         // std::cout << "img1: " << img1.cols << "x" << img1.rows << std::endl;
-        ImGui::Text("img: %dx%d", img.cols, img.rows);
-        ImGui::Text("average pixel color: %f", mean(img)[0]);
         //glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, img.cols, img.rows, 0, GL_RGB, GL_UNSIGNED_BYTE, img.ptr());
+        }
+        ImGui::Text("img: %dx%d", img.cols, img.rows);
+        ImGui::Text("average pixel color: %f", mean(img)[0]);
         ImGui::Image((void*)(intptr_t)textureID, ImVec2(960, 540));
         //ImGui::Image((void*)(intptr_t)textureID, ImVec2(192, 108));
         ImGui::End();

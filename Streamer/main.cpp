@@ -27,6 +27,9 @@ using namespace cv;
 #include <thread>
 #include <mutex>
 
+// serial port stuff
+#include <lib/serialib.h>
+
 #include <stdio.h>
 #define GL_SILENCE_DEPRECATION
 #if defined(IMGUI_IMPL_OPENGL_ES2)
@@ -209,6 +212,8 @@ void takeScreenshot()
     }
 }
 
+uint window_width = 800;
+uint window_height = 600;
 // GUI thread
 GLuint textureID;
 void guiThread()
@@ -250,11 +255,13 @@ void guiThread()
 #endif
 
     // Create window with graphics context
-    GLFWwindow *window = glfwCreateWindow(1280, 720, "Dear ImGui GLFW+OpenGL3 example", NULL, NULL);
+    GLFWwindow *window = glfwCreateWindow(window_width, window_height, "EL Streamer", NULL, NULL);
     if (window == NULL)
         return;
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1); // Enable vsync
+    // set the smallest allowed window size
+    glfwSetWindowSizeLimits(window, 400, 300, GLFW_DONT_CARE, GLFW_DONT_CARE);
 
     // Setup Dear ImGui context
     IMGUI_CHECKVERSION();
@@ -305,10 +312,23 @@ void guiThread()
 
         // static float f = 0.0f;
         // static int counter = 0;
+
+        // get glfw window size
+        int width, height;
+        glfwGetWindowSize(window, &width, &height);
+        window_width = width;
+        window_height = height;
         if (!first_start)
         {
-            ImGui::Begin("EL STREAMER");                       // Create a window called "Hello, world!" and append into it.
-            ImGui::SetWindowSize(ImVec2(800, 600));
+            ImGuiWindowFlags window_flags = 0;
+            window_flags |= ImGuiWindowFlags_NoTitleBar;
+            window_flags |= ImGuiWindowFlags_NoResize;
+            window_flags |= ImGuiWindowFlags_NoMove;
+            window_flags |= ImGuiWindowFlags_NoScrollbar;
+
+            ImGui::Begin("EL STREAMER", NULL, window_flags);                       // Create a window called "Hello, world!" and append into it.
+            ImGui::SetWindowSize(ImVec2(window_width, window_height));
+            ImGui::SetWindowPos(ImVec2(0, 0));
             ImGui::Text("Welcome to EL Streamer");             // Display some text (you can use a format strings too)
             ImGui::Checkbox("Demo Window", &show_demo_window); // Edit bools storing our window open/close state
             ImGui::ColorEdit3("clear color", (float *)&clear_color); // Edit 3 floats representing a color
@@ -344,7 +364,7 @@ void guiThread()
             scTime = deltaScTime;
             scDtMutex.unlock();
             ImGui::Text("Application average %.3f ms/frame (%.1f FPS); Screenshot thread: %.3f ms/frame", frameTime, io.Framerate, scTime);
-            ImGui::PlotLines("Frame Times", arrFrameTimes, IM_ARRAYSIZE(arrFrameTimes), 0, NULL, 0, maxFrameTime, ImVec2(0, 80));
+            ImGui::PlotLines("##Frame Time Graph", arrFrameTimes, IM_ARRAYSIZE(arrFrameTimes), 0, NULL, 0, maxFrameTime, ImVec2(window_width, 80));
 
             // ImageFromDisplay(Pixels, Width, Height, Bpp);
             // img1 = Mat(Height, Width, Bpp > 24 ? CV_8UC4 : CV_8UC3, &Pixels[0]);
@@ -372,10 +392,18 @@ void guiThread()
             ImGui::End();
         }else{
             first_start = false;
-            ImGui::Begin("EL STREAMER");
+            ImGuiWindowFlags window_flags = 0;
+            window_flags |= ImGuiWindowFlags_NoTitleBar;
+            window_flags |= ImGuiWindowFlags_NoResize;
+            window_flags |= ImGuiWindowFlags_NoMove;
+            window_flags |= ImGuiWindowFlags_NoScrollbar;
+
+            ImGui::Begin("EL STREAMER", NULL, window_flags);
+
             // define the size of the subwindow
             ImGui::SetWindowSize(ImVec2(300, 200));
-            ImGui::SetWindowPos(ImVec2(0, 0));
+            if(window_width > 300 && window_height > 200)
+                ImGui::SetWindowPos(ImVec2((window_width/2)-150, (window_height/2)-100));
             ImGui::Text("Please Select the display size");
             static int x_size = x_disp_size;
             static int y_size = y_disp_size;
@@ -393,7 +421,72 @@ void guiThread()
             x_disp_size = x_size;
             y_disp_size = y_size;
             dispSizeMutex.unlock();
+
+            static char* items[99] = {0};
+            static int item_current = -1; // If the selection isn't within 0..count, Combo won't display a preview
+            static char selected_port[24] = "Select port\0";
+            ImGui::PushItemWidth(150);
+            // ImGui::Combo("##PortSelector", &item_current, items, IM_ARRAYSIZE(items));
+            if (ImGui::BeginCombo("##PortSelector", selected_port))
+            {
+                for (int n = 0; n < IM_ARRAYSIZE(items); n++)
+                {
+                    const bool is_selected = (item_current == n);
+                    if(items[n] != NULL){
+                        if (ImGui::Selectable(items[n], is_selected)){
+                            item_current = n;
+                            strcpy(selected_port, items[n]);
+                        }
+                    
+                        // Set the initial focus when opening the combo (scrolling + keyboard navigation focus)
+                        if (is_selected){
+                            ImGui::SetItemDefaultFocus();
+                        }
+                    }
+                }
+                ImGui::EndCombo();
+            }
+
+            ImGui::SameLine();
+
+            static bool scan = false;
+            char device_name[99][24];
+            scan = ImGui::Button("Scan", ImVec2(100, 20));
+            if(scan){
+                scan = false;
+                serialib device;
+                for (int i=0;i<98;i++)
+                {
+                    // Prepare the port name (Windows)
+                    #if defined (_WIN32) || defined( _WIN64)
+                        sprintf (device_name[i],"\\\\.\\COM%d",i+1);
+                    #endif
+
+                    // Prepare the port name (Linux)
+                    #ifdef __linux__
+                        sprintf (device_name[i],"/dev/ttyACM%d",i);
+                    #endif
+
+                    // try to connect to the device
+                    if (device.openDevice(device_name[i],115200)==1)
+                    {
+                        printf ("Device detected on %s\n", device_name[i]);
+                        std::cout << device_name[i] << std::endl;
+                        // set the pointer to the array
+                        items[i] = device_name[i];
+                        // Close the device before testing the next port
+                        device.closeDevice();
+                    }else{
+                        items[i] = NULL;
+                    }
+                }
+            }
+
+            // center the button
+            ImGui::SetCursorPosX((300-100)/2);
+            ImGui::SetCursorPosY(150);
             first_start = !ImGui::Button("Apply", ImVec2(100, 20));
+            
             ImGui::End();
 
         }

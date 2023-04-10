@@ -111,22 +111,26 @@ uint monitor_height = 0;
 uint x_disp_size = 320;
 uint y_disp_size = 240;
 
+bool entireDisp = false;
+
+int threshHigh = 100;
+int threshMid = 50;
+
 // we use an interleaved frame buffer
 Mat img1;                           // the first frame buffer
-std::vector<uint8_t> data_buffer;   // the raw binary frame buffer that will be sent to the display
-std::vector<uint8_t> target_buffer; // the raw binary frame buffer that will be sent to the display
 bool changeFb = false;              // flag to indicate that the frame buffer has changed
+int scWidth = 0;                    // the width of the screenshot
+int scHeight = 0;                   // the height of the screenshot
+std::mutex scSzMutex;               // mutex for the frame buffer dimensions
 std::mutex scFbMutex;               // mutex for the frame buffer
 std::mutex scDtMutex;               // mutex for the time between two screenshots
 std::mutex scFbChangeMutex;         // mutex for the flag changeFb
 std::mutex gtFrMutex;               // mutex for the frame rate
-std::mutex dispSizeMutex;           // mutex for the display size
-std::mutex scTbMutex;               // mutex for the target buffer
 
 float frameRate = 0.0;    // the target frame rate
 double deltaScTime = 0.0; // time between two screenshots
 
-void takeScreenshot()
+void ScreenshotThread()
 {
 
     int Width = 0;
@@ -143,56 +147,18 @@ void takeScreenshot()
         ImageFromDisplay(Pixels, Width, Height, Bpp);
         buff = Mat(Height, Width, Bpp > 24 ? CV_8UC4 : CV_8UC3, &Pixels[0]);
 
-        dispSizeMutex.lock();
-        size_x = x_disp_size;
-        size_y = y_disp_size;
-        dispSizeMutex.unlock();
-
-        int x_step = Width / size_x;
-        int y_step = Height / size_y;
-        // get the length of the buffer
-        int stride = (buff.total() * buff.elemSize()) / Height;
-
-        // uint8_t target_buffer [size_x * size_y];
-        uint32_t index = 0;
-        scTbMutex.lock();
-        // define the target buffer size
-        target_buffer.resize(size_x * size_y);
-        // clear the target buffer
-        target_buffer.clear();
-        // iterate over each pixel of target display
-        for (int y = 0; y < size_y; y++)
-        {
-            for (int x = 0; x < size_x; x++)
-            {
-                int big_x = x * x_step;
-                int big_y = y * y_step;
-                // get the pixel value
-                Vec4b pixel = buff.at<Vec4b>(big_y, big_x);
-                pixel[0] = 0; // B
-                pixel[1] = 0; // G
-                pixel[2] = 0; // R
-                // calculate and store the average value
-                uint8_t avg = (pixel[0] + pixel[1] + pixel[2]) / 3;
-                target_buffer[index] = avg;
-                // set the pixel value
-                index++;
-            }
-        }
-        scTbMutex.unlock();
-
-        // crop buff to X_DISP x Y_DISP and store the result in bwCropped
-        // buff = buff(Rect(0, 0, size_x, size_y));
-        // convert bwCropped to black and white
-        // cvtColor(buff, buff, COLOR_BGR2GRAY);
-
-        scFbChangeMutex.lock();
-        changeFb = true;
-        scFbChangeMutex.unlock();
+        scSzMutex.lock();
+        scWidth = Width;
+        scHeight = Height;
+        scSzMutex.unlock();
 
         scFbMutex.lock();
         img1 = buff.clone();
         scFbMutex.unlock();
+
+        scFbChangeMutex.lock();
+        changeFb = true;
+        scFbChangeMutex.unlock();
 
         auto end = std::chrono::system_clock::now();
         std::chrono::duration<double> elapsed_seconds = end - start;
@@ -200,8 +166,7 @@ void takeScreenshot()
         // calculate the required delay for to hit the target frame rate
         float delay = 1000.0 / frameRate - elapsed_seconds.count() * 1000;
         gtFrMutex.unlock();
-        if (delay > 0)
-        {
+        if (delay > 0){
             std::this_thread::sleep_for(std::chrono::milliseconds((int)delay));
         }
         end = std::chrono::system_clock::now();
@@ -211,6 +176,129 @@ void takeScreenshot()
         scDtMutex.unlock();
     }
 }
+
+
+std::vector<uint8_t> data_buffer;   // the raw binary frame buffer that will be sent to the display
+std::vector<uint8_t> target_buffer; // the buffer containing the image data that will be converted to raw binary data
+
+std::mutex dispSizeMutex;           // mutex for the display size
+std::mutex scTbMutex;               // mutex for the target buffer
+Mat img2;
+bool newImg = false;
+std::mutex newImgMutex;
+bool newData = false;
+std::mutex newDataMutex;
+void ComputeThread(){
+    uint size_x = 0;
+    uint size_y = 0;
+    int Width = 0;
+    int Height = 0;
+    int stride = 0;
+    int x_step = 0;
+    int y_step = 0;
+    Mat buff;
+    // slow this down a bit
+    while(true){
+        bool changed = false;
+        scFbChangeMutex.lock();
+        changed = changeFb;
+        changeFb = false;
+        scFbChangeMutex.unlock();
+        if(changed){
+            dispSizeMutex.lock();
+            size_x = x_disp_size;
+            size_y = y_disp_size;
+            dispSizeMutex.unlock();
+            scSzMutex.lock();
+            Width = scWidth;
+            Height = scHeight;
+            scSzMutex.unlock();
+            scFbMutex.lock();
+            buff = img1.clone();
+            scFbMutex.unlock();
+            if(entireDisp){
+                x_step = Width / size_x;
+                y_step = Height / size_y;
+            }else{
+                x_step = 1;
+                y_step = 1;
+            }
+            // get the length of the buffer
+            if(Height != 0){
+                stride = (buff.total() * buff.elemSize()) / Height;
+            }else{
+                continue;
+            }
+            // uint8_t target_buffer [size_x * size_y];
+            uint32_t index = 0;
+            scTbMutex.lock();
+            // define the target buffer size
+            target_buffer.resize(size_x * size_y);
+    
+            // iterate over each pixel of target display
+            for (int y = 0; y < size_y; y++)
+            {
+                for (int x = 0; x < size_x; x++)
+                {
+                    int big_x = x * x_step;
+                    int big_y = y * y_step;
+                    // get the pixel value
+                    Vec4b pixel = buff.at<Vec4b>(big_y, big_x);
+                    // pixel[0] B
+                    // pixel[1] G
+                    // pixel[2] R
+                    // calculate and store the average value
+                    uint8_t avg = (pixel[0] + pixel[1] + pixel[2]) / 3;
+                    target_buffer[index] = avg;
+                    // std::cout << (int)avg << std::endl;
+                    // set the pixel value
+                    index++;
+                }
+            }
+            newImgMutex.lock();
+            newImg = true;
+            newImgMutex.unlock();
+            // now we will compute the raw binary data
+            data_buffer.resize(size_x * size_y / 4);    // 4 pixels per byte
+            for(int i = 0; i < data_buffer.size(); i++){
+                // threshold represents the maximum brightness value
+                // so if a pixel is > threshold, we set it to 11
+                // if it's threshold/2, we set it to 10
+                // if it's 0, we set it to 00
+
+                // byte structure:
+                // 00 00 00 00 - 1 byte
+                // each collection of 2 bits is a brightness value
+                // 00 = black
+                // 01 = 1 - 50% in our case
+                // 10 || 11 = 2 - 100% in our case
+
+                uint8_t data;
+                
+                // get the pixel values
+                for(int j = 0; j < 4; j++){
+                    uint8_t buff = target_buffer[i * 4 + j];
+                    if(buff > threshHigh){
+                        buff = 2;
+                    }else if(buff > threshMid){
+                        buff = 1;
+                    }else{
+                        buff = 0;
+                    }
+                    target_buffer[i * 4 + j] = buff * 127;
+                    // pack the buffer into the byte
+                    data |= buff << (6 - j*2);
+                }
+                data_buffer[i] = data;
+            }
+            // convert the target buffer into a black and white CV2 image
+            img2 = Mat(size_y, size_x, CV_8UC1, &target_buffer[0]);
+            scTbMutex.unlock();
+        }
+    }
+
+}
+
 
 uint window_width = 800;
 uint window_height = 600;
@@ -280,7 +368,7 @@ void guiThread()
     glewInit();
     // Our state
     bool show_demo_window = false;
-    ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
+    ImVec4 clear_color = ImVec4(1.0f, 1.0f, 0.0f, 1.00f);
 
     // Main loop
 #ifdef __EMSCRIPTEN__
@@ -332,6 +420,8 @@ void guiThread()
             ImGui::Text("Welcome to EL Streamer");             // Display some text (you can use a format strings too)
             ImGui::Checkbox("Demo Window", &show_demo_window); // Edit bools storing our window open/close state
             ImGui::ColorEdit3("clear color", (float *)&clear_color); // Edit 3 floats representing a color
+            ImGui::SliderInt("High Threshold", &threshHigh, 0, 255);
+            ImGui::SliderInt("Mid Threshold", &threshMid, 0, 255);
             // if (ImGui::Button("Button"))                            // Buttons return true when clicked (most widgets return true when edited/activated)
             //     counter++;
             // ImGui::SameLine();
@@ -370,17 +460,46 @@ void guiThread()
             // img1 = Mat(Height, Width, Bpp > 24 ? CV_8UC4 : CV_8UC3, &Pixels[0]);
 
             bool bufferChanged = false;
-            scFbChangeMutex.lock();
-            bufferChanged = changeFb;
-            changeFb = false;
-            scFbChangeMutex.unlock();
+
+            // scFbChangeMutex.lock();
+            // bufferChanged = changeFb;
+            // changeFb = false;
+            // scFbChangeMutex.unlock();
+
+
+            newImgMutex.lock();
+            bufferChanged = newImg;
+            newImg = false;
+            newImgMutex.unlock();
+
+    
+
 
             if (bufferChanged)
             {
-                scFbMutex.lock();
-                img = img1.clone();
-                scFbMutex.unlock();
-                cvtColor(img, img, cv::COLOR_BGR2RGB);
+                // scFbMutex.lock();
+                // img = img1.clone();
+                // scFbMutex.unlock();
+                // cvtColor(img, img, cv::COLOR_BGR2RGB);
+
+                scTbMutex.lock();
+                img = img2.clone();
+                scTbMutex.unlock();
+
+                // convert the icvtColor(img, img, cv::COLOR_BGR2RGB);mg cvtColor(img, img, cv::COLOR_BGR2RGB);buffer from CV_8UC1 to RGB
+                cv::cvtColor(img, img, cv::COLOR_GRAY2RGB);
+
+                // multiply each pixel by respective clear_color value
+                for (int i = 0; i < img.rows; i++)
+                {
+                    for (int j = 0; j < img.cols; j++)
+                    {
+                        img.at<cv::Vec3b>(i, j)[0] = img.at<cv::Vec3b>(i, j)[0] * clear_color.x;
+                        img.at<cv::Vec3b>(i, j)[1] = img.at<cv::Vec3b>(i, j)[1] * clear_color.y;
+                        img.at<cv::Vec3b>(i, j)[2] = img.at<cv::Vec3b>(i, j)[2] * clear_color.z;
+                    }
+                }
+
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -388,7 +507,7 @@ void guiThread()
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, img.cols, img.rows, 0, GL_RGB, GL_UNSIGNED_BYTE, img.ptr());
                 // glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, x_size, y_size, 0, GL_RGB, GL_UNSIGNED_BYTE, img.ptr());
             }
-            ImGui::Image((void *)(intptr_t)textureID, ImVec2(img.cols / 2 /**((float)x_size/img.cols)*/, img.rows / 2 /**((float)y_size/img.rows)*/));
+            ImGui::Image((void *)(intptr_t)textureID, ImVec2(img.cols, img.rows));
             ImGui::End();
         }else{
             first_start = false;
@@ -409,18 +528,20 @@ void guiThread()
             static int y_size = y_disp_size;
             ImGui::SliderInt("X Size", &x_size, 1, monitor_width);
             ImGui::SliderInt("Y Size", &y_size, 1, monitor_height);
-            if (x_size > monitor_width)
-            {
-                x_size = monitor_width;
+            // the selected size needs to be a multiple of 4
+            if(x_size % 4 != 0){
+                x_size = x_size - (x_size % 4);
             }
-            if (y_size > monitor_height)
-            {
-                y_size = monitor_height;
+            if(y_size % 4 != 0){
+                y_size = y_size - (y_size % 4);
             }
+
             dispSizeMutex.lock();
             x_disp_size = x_size;
             y_disp_size = y_size;
             dispSizeMutex.unlock();
+            ImGui::Text("Should the stream be fullscreen?");
+            ImGui::Checkbox("Fullscreen", &entireDisp);
 
             static char* items[99] = {0};
             static int item_current = -1; // If the selection isn't within 0..count, Combo won't display a preview
@@ -496,7 +617,7 @@ void guiThread()
         int display_w, display_h;
         glfwGetFramebufferSize(window, &display_w, &display_h);
         glViewport(0, 0, display_w, display_h);
-        glClearColor(clear_color.x * clear_color.w, clear_color.y * clear_color.w, clear_color.z * clear_color.w, clear_color.w);
+        //glClearColor(clear_color.x * clear_color.w, clear_color.y * clear_color.w, clear_color.z * clear_color.w, clear_color.w);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
@@ -549,7 +670,10 @@ int main(int, char **)
     /////////////////////////  OPENCV SCREENSHOT END  /////////////////////////
 
     // start the screenshot thread
-    std::thread screenshotThread(takeScreenshot);
+    std::thread screenshotThread(ScreenshotThread);
+
+    // start the compute thread
+    std::thread computeThread(ComputeThread);
 
     // start the imgui thread
     std::thread imguiThread(guiThread);

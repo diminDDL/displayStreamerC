@@ -63,6 +63,11 @@
         "stop_token": "cpp",
         "thread": "cpp",
         "typeindex": "cpp",
-        "variant": "cpp"
+        "variant": "cpp",
+        "cstdarg": "cpp",
+        "unordered_set": "cpp",
+        "numeric": "cpp",
+        "cfenv": "cpp",
+        "cinttypes": "cpp"
     }
 }

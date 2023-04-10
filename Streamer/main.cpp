@@ -111,10 +111,17 @@ uint monitor_height = 0;
 uint x_disp_size = 320;
 uint y_disp_size = 240;
 
+int x_offset = 0;
+int y_offset = 0;
+
 bool entireDisp = false;
 
 int threshHigh = 100;
 int threshMid = 50;
+
+char selected_port[24] = "Select port\0";
+
+char magic_symbol = 'A';
 
 // we use an interleaved frame buffer
 Mat img1;                           // the first frame buffer
@@ -182,7 +189,9 @@ std::vector<uint8_t> data_buffer;   // the raw binary frame buffer that will be 
 std::vector<uint8_t> target_buffer; // the buffer containing the image data that will be converted to raw binary data
 
 std::mutex dispSizeMutex;           // mutex for the display size
-std::mutex scTbMutex;               // mutex for the target buffer
+std::mutex scTbMutex;               // mutex for the preview
+std::mutex offsetMutex;             // mutex for the offset
+
 Mat img2;
 bool newImg = false;
 std::mutex newImgMutex;
@@ -196,6 +205,8 @@ void ComputeThread(){
     int stride = 0;
     int x_step = 0;
     int y_step = 0;
+    uint offset_x = 0;
+    uint offset_y = 0;
     Mat buff;
     // slow this down a bit
     while(true){
@@ -216,6 +227,10 @@ void ComputeThread(){
             scFbMutex.lock();
             buff = img1.clone();
             scFbMutex.unlock();
+            offsetMutex.lock();
+            offset_x = x_offset;
+            offset_y = y_offset;
+            offsetMutex.unlock();
             if(entireDisp){
                 x_step = Width / size_x;
                 y_step = Height / size_y;
@@ -231,6 +246,7 @@ void ComputeThread(){
             }
             // uint8_t target_buffer [size_x * size_y];
             uint32_t index = 0;
+            
             scTbMutex.lock();
             // define the target buffer size
             target_buffer.resize(size_x * size_y);
@@ -240,8 +256,8 @@ void ComputeThread(){
             {
                 for (int x = 0; x < size_x; x++)
                 {
-                    int big_x = x * x_step;
-                    int big_y = y * y_step;
+                    int big_x = x * x_step + offset_x;
+                    int big_y = y * y_step + offset_y;
                     // get the pixel value
                     Vec4b pixel = buff.at<Vec4b>(big_y, big_x);
                     // pixel[0] B
@@ -255,9 +271,7 @@ void ComputeThread(){
                     index++;
                 }
             }
-            newImgMutex.lock();
-            newImg = true;
-            newImgMutex.unlock();
+
             // now we will compute the raw binary data
             data_buffer.resize(size_x * size_y / 4);    // 4 pixels per byte
             for(int i = 0; i < data_buffer.size(); i++){
@@ -273,32 +287,80 @@ void ComputeThread(){
                 // 01 = 1 - 50% in our case
                 // 10 || 11 = 2 - 100% in our case
 
-                uint8_t data;
+                uchar data[4] = {0};
                 
                 // get the pixel values
                 for(int j = 0; j < 4; j++){
-                    uint8_t buff = target_buffer[i * 4 + j];
+                    uchar buff = target_buffer[i * 4 + j];
+                    //std::cout << (int)buff << " ";
                     if(buff > threshHigh){
-                        buff = 2;
+                        data[j] = 2;
                     }else if(buff > threshMid){
-                        buff = 1;
+                        data[j] = 1;
                     }else{
-                        buff = 0;
-                    }
-                    target_buffer[i * 4 + j] = buff * 127;
-                    // pack the buffer into the byte
-                    data |= buff << (6 - j*2);
+                        data[j] = 0;
+                    } 
+                    target_buffer[i * 4 + j] = data[j] * 127;
                 }
-                data_buffer[i] = data;
+
+                uchar byte = 0;
+                for(int j = 0; j < 4; j++){
+                    byte |= data[j] << (6 - j * 2);
+                }        
+                data_buffer[i] = byte;
             }
             // convert the target buffer into a black and white CV2 image
             img2 = Mat(size_y, size_x, CV_8UC1, &target_buffer[0]);
             scTbMutex.unlock();
+            newDataMutex.lock();
+            newData = true;
+            newDataMutex.unlock();
+            newImgMutex.lock();
+            newImg = true;
+            newImgMutex.unlock();
         }
     }
 
 }
 
+
+std::mutex serialDlMutex;
+double deltaSerialTime = 0.0; // time between two screenshots
+void SerialThread(){
+    serialib device;
+    while(true){
+        if(device.openDevice(selected_port, 115200) == 1){
+            bool new_data = false;
+            std::vector<uint8_t> data;
+            while(true){
+                auto start = std::chrono::system_clock::now();
+                newDataMutex.lock();
+                new_data = newData;
+                newData = false;
+                newDataMutex.unlock();
+                if(new_data){
+                    scTbMutex.lock();
+                    data = data_buffer;
+                    scTbMutex.unlock();
+                    char read;
+                    device.readChar(&read);
+                    if(read == magic_symbol){
+                        device.writeBytes(data.data(), data.size());
+                        auto end = std::chrono::system_clock::now();
+                        std::chrono::duration<double> elapsed_seconds = end - start;
+                        serialDlMutex.lock();
+                        deltaSerialTime = elapsed_seconds.count() * 1000;
+                        serialDlMutex.unlock();
+                    }
+                }
+            }
+        }else{
+            std::cout << "Failed to open device" << std::endl;
+            // sleep chrono
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        }
+    }
+}
 
 uint window_width = 800;
 uint window_height = 600;
@@ -422,6 +484,15 @@ void guiThread()
             ImGui::ColorEdit3("clear color", (float *)&clear_color); // Edit 3 floats representing a color
             ImGui::SliderInt("High Threshold", &threshHigh, 0, 255);
             ImGui::SliderInt("Mid Threshold", &threshMid, 0, 255);
+            
+            if(!entireDisp){
+                offsetMutex.lock();
+                dispSizeMutex.lock();
+                ImGui::SliderInt("Offset X", &x_offset, 0, monitor_width - x_disp_size);
+                ImGui::SliderInt("Offset Y", &y_offset, 0, monitor_height - y_disp_size);
+                dispSizeMutex.unlock();
+                offsetMutex.unlock();
+            }
             // if (ImGui::Button("Button"))                            // Buttons return true when clicked (most widgets return true when edited/activated)
             //     counter++;
             // ImGui::SameLine();
@@ -453,7 +524,11 @@ void guiThread()
             scDtMutex.lock();
             scTime = deltaScTime;
             scDtMutex.unlock();
-            ImGui::Text("Application average %.3f ms/frame (%.1f FPS); Screenshot thread: %.3f ms/frame", frameTime, io.Framerate, scTime);
+            double serialTime = 0;
+            serialDlMutex.lock();
+            serialTime = deltaSerialTime;
+            serialDlMutex.unlock();
+            ImGui::Text("Application average %.3f ms/frame (%.1f FPS); Screenshot thread: %.3f ms/frame; Serial thread: %.3f ms", frameTime, io.Framerate, scTime, serialTime);
             ImGui::PlotLines("##Frame Time Graph", arrFrameTimes, IM_ARRAYSIZE(arrFrameTimes), 0, NULL, 0, maxFrameTime, ImVec2(window_width, 80));
 
             // ImageFromDisplay(Pixels, Width, Height, Bpp);
@@ -545,7 +620,6 @@ void guiThread()
 
             static char* items[99] = {0};
             static int item_current = -1; // If the selection isn't within 0..count, Combo won't display a preview
-            static char selected_port[24] = "Select port\0";
             ImGui::PushItemWidth(150);
             // ImGui::Combo("##PortSelector", &item_current, items, IM_ARRAYSIZE(items));
             if (ImGui::BeginCombo("##PortSelector", selected_port))
@@ -567,12 +641,12 @@ void guiThread()
                 }
                 ImGui::EndCombo();
             }
+            //std::cout << selected_port << std::endl;
 
             ImGui::SameLine();
 
-            static bool scan = false;
+            static bool scan = true;
             char device_name[99][24];
-            scan = ImGui::Button("Scan", ImVec2(100, 20));
             if(scan){
                 scan = false;
                 serialib device;
@@ -591,8 +665,7 @@ void guiThread()
                     // try to connect to the device
                     if (device.openDevice(device_name[i],115200)==1)
                     {
-                        printf ("Device detected on %s\n", device_name[i]);
-                        std::cout << device_name[i] << std::endl;
+                        // printf ("Device detected on %s\n", device_name[i]);
                         // set the pointer to the array
                         items[i] = device_name[i];
                         // Close the device before testing the next port
@@ -602,6 +675,8 @@ void guiThread()
                     }
                 }
             }
+
+            scan = ImGui::Button("Scan", ImVec2(100, 20));
 
             // center the button
             ImGui::SetCursorPosX((300-100)/2);
@@ -674,6 +749,9 @@ int main(int, char **)
 
     // start the compute thread
     std::thread computeThread(ComputeThread);
+
+    // start the serial stream thread
+    std::thread serialThread(SerialThread);
 
     // start the imgui thread
     std::thread imguiThread(guiThread);

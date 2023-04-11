@@ -114,6 +114,9 @@ uint y_disp_size = 240;
 int x_offset = 0;
 int y_offset = 0;
 
+int global_x_step = 1;
+int global_y_step = 1;
+
 bool entireDisp = false;
 
 int threshHigh = 100;
@@ -191,6 +194,7 @@ std::vector<uint8_t> target_buffer; // the buffer containing the image data that
 std::mutex dispSizeMutex;           // mutex for the display size
 std::mutex scTbMutex;               // mutex for the preview
 std::mutex offsetMutex;             // mutex for the offset
+std::mutex stepMutex;               // mutex for the step
 
 Mat img2;
 bool newImg = false;
@@ -235,8 +239,16 @@ void ComputeThread(){
                 x_step = Width / size_x;
                 y_step = Height / size_y;
             }else{
-                x_step = 1;
-                y_step = 1;
+                stepMutex.lock();
+                x_step = global_x_step;
+                y_step = global_y_step;
+                stepMutex.unlock();
+                if(x_step > Width / size_x){
+                    x_step = Width / size_x;
+                }
+                if(y_step > Height / size_y){
+                    y_step = Height / size_y;
+                }
             }
             // get the length of the buffer
             if(Height != 0){
@@ -484,15 +496,19 @@ void guiThread()
             ImGui::SetWindowPos(ImVec2(0, 0));
             ImGui::Text("Welcome to EL Streamer");             // Display some text (you can use a format strings too)
             ImGui::Checkbox("Demo Window", &show_demo_window); // Edit bools storing our window open/close state
-            ImGui::ColorEdit3("clear color", (float *)&clear_color); // Edit 3 floats representing a color
+            ImGui::ColorEdit3("Color", (float *)&clear_color); // Edit 3 floats representing a color
             ImGui::SliderInt("High Threshold", &threshHigh, 0, 255);
             ImGui::SliderInt("Mid Threshold", &threshMid, 0, 255);
             
             if(!entireDisp){
                 offsetMutex.lock();
                 dispSizeMutex.lock();
+                stepMutex.lock();
                 ImGui::SliderInt("Offset X", &x_offset, 0, monitor_width - x_disp_size);
                 ImGui::SliderInt("Offset Y", &y_offset, 0, monitor_height - y_disp_size);
+                ImGui::SliderInt("Step X", &global_x_step, 1, monitor_width / x_disp_size);
+                ImGui::SliderInt("Step Y", &global_y_step, 1, monitor_height / y_disp_size);
+                stepMutex.unlock();
                 dispSizeMutex.unlock();
                 offsetMutex.unlock();
             }
@@ -587,6 +603,8 @@ void guiThread()
             }
             ImGui::Image((void *)(intptr_t)textureID, ImVec2(img.cols, img.rows));
             ImGui::End();
+            // se the background color to white
+            glClearColor(1.0f, 1.0f, 1.0f, 1.0f);
         }else{
             first_start = false;
             ImGuiWindowFlags window_flags = 0;

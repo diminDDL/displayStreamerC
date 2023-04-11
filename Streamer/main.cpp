@@ -328,12 +328,12 @@ std::mutex serialDlMutex;
 double deltaSerialTime = 0.0; // time between two screenshots
 void SerialThread(){
     serialib device;
+    auto lastStart = std::chrono::system_clock::now();
     while(true){
         if(device.openDevice(selected_port, 115200) == 1){
             bool new_data = false;
             std::vector<uint8_t> data;
             while(true){
-                auto start = std::chrono::system_clock::now();
                 newDataMutex.lock();
                 new_data = newData;
                 newData = false;
@@ -342,20 +342,23 @@ void SerialThread(){
                     scTbMutex.lock();
                     data = data_buffer;
                     scTbMutex.unlock();
-                    char read;
+                    char read = 0;
                     device.readChar(&read);
                     if(read == magic_symbol){
+                        device.flushReceiver();
                         device.writeBytes(data.data(), data.size());
                         auto end = std::chrono::system_clock::now();
-                        std::chrono::duration<double> elapsed_seconds = end - start;
+                        std::chrono::duration<double> elapsed_seconds = end - lastStart;
                         serialDlMutex.lock();
                         deltaSerialTime = elapsed_seconds.count() * 1000;
                         serialDlMutex.unlock();
+                        lastStart = std::chrono::system_clock::now();
                     }
+                    device.flushReceiver();
                 }
             }
         }else{
-            std::cout << "Failed to open device" << std::endl;
+            // std::cout << "Failed to open device" << std::endl;
             // sleep chrono
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
         }

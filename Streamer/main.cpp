@@ -1,61 +1,33 @@
-// Dear ImGui: standalone example application for GLFW + OpenGL 3, using programmable pipeline
-// (GLFW is a cross-platform general purpose library for handling windows, inputs, OpenGL/Vulkan/Metal graphics context creation, etc.)
-// If you are new to Dear ImGui, read documentation from the docs/ folder + read the top of imgui.cpp.
-// Read online: https://github.com/ocornut/imgui/tree/master/docs
+// TODO fix the pixel size and offset slider crashing the app
 #include <GL/glew.h>
-// #define _GLFW_BUILD_DLL
 #include "imgui.h"
-// #include "imgui_impl_opengl3_loader.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
-
-// include time for delay
 #include <chrono>
 #include <thread>
-
-// include opencv and other stuff for screenshot
 #include <opencv2/opencv.hpp>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <cstdint>
 #include <cstring>
 #include <vector>
-
-using namespace cv;
-
-// threading
 #include <thread>
 #include <mutex>
-
-// serial port stuff
 #include <lib/serialib.h>
-
 #include <stdio.h>
+
 #define GL_SILENCE_DEPRECATION
 #if defined(IMGUI_IMPL_OPENGL_ES2)
 #include <GLES2/gl2.h>
 #endif
 #include <GLFW/glfw3.h> // Will drag system OpenGL headers
 
-// [Win32] Our example includes a copy of glfw3.lib pre-compiled with VS2010 to maximize ease of testing and compatibility with old VS compilers.
-// To link with VS2010-era libraries, VS2015+ requires linking with legacy_stdio_definitions.lib, which we do using this pragma.
-// Your own project should not be affected, as you are likely to link with a newer binary of GLFW that is adequate for your version of Visual Studio.
-#if defined(_MSC_VER) && (_MSC_VER >= 1900) && !defined(IMGUI_DISABLE_WIN32_FUNCTIONS)
-#pragma comment(lib, "legacy_stdio_definitions")
-#include <Windows.h>
-#define WIN_ENABLED
-#endif
-
-// This example can also compile and run with Emscripten! See 'Makefile.emscripten' for details.
-#ifdef __EMSCRIPTEN__
-#include "../libs/emscripten/emscripten_mainloop_stub.h"
-#endif
-
 static void glfw_error_callback(int error, const char *description)
 {
     fprintf(stderr, "GLFW Error %d: %s\n", error, description);
 }
 
+// TODO idk if this actually works as I don't use windows
 #ifdef WIN_ENABLED
 void ImageFromDisplay(std::vector<uint8_t> &Pixels, int &Width, int &Height, int &BitsPerPixel)
 {
@@ -103,6 +75,16 @@ void ImageFromDisplay(std::vector<uint8_t> &Pixels, int &Width, int &Height, int
     XDestroyImage(img);
     XCloseDisplay(display);
 }
+void getSize(int &Width, int &Height){
+    Display *display = XOpenDisplay(nullptr);
+    Window root = DefaultRootWindow(display);
+
+    XWindowAttributes attributes = {0};
+    XGetWindowAttributes(display, root, &attributes);
+
+    Width = attributes.width;
+    Height = attributes.height;
+}
 #endif
 
 uint monitor_width = 0;
@@ -126,64 +108,47 @@ char selected_port[24] = "Select port\0";
 
 char magic_symbol = 'A';
 
-// we use an interleaved frame buffer
-Mat img1;                           // the first frame buffer
+cv::Mat img1;                       // the first frame buffer
 bool changeFb = false;              // flag to indicate that the frame buffer has changed
 int scWidth = 0;                    // the width of the screenshot
 int scHeight = 0;                   // the height of the screenshot
-std::mutex scSzMutex;               // mutex for the frame buffer dimensions
-std::mutex scFbMutex;               // mutex for the frame buffer
-std::mutex scDtMutex;               // mutex for the time between two screenshots
+
 std::mutex scFbChangeMutex;         // mutex for the flag changeFb
-std::mutex gtFrMutex;               // mutex for the frame rate
 
 float frameRate = 0.0;    // the target frame rate
 double deltaScTime = 0.0; // time between two screenshots
 
 void ScreenshotThread()
 {
-
     int Width = 0;
     int Height = 0;
     int Bpp = 0;
     uint size_x = 0;
     uint size_y = 0;
     std::vector<std::uint8_t> Pixels;
-    Mat buff;
+    cv::Mat buff;
     while (true)
     {
+        // here we just take a screenshot and convert it to a cv::Mat
         auto start = std::chrono::system_clock::now();
-
         ImageFromDisplay(Pixels, Width, Height, Bpp);
-        buff = Mat(Height, Width, Bpp > 24 ? CV_8UC4 : CV_8UC3, &Pixels[0]);
-
-        scSzMutex.lock();
+        buff = cv::Mat(Height, Width, Bpp > 24 ? CV_8UC4 : CV_8UC3, &Pixels[0]);
         scWidth = Width;
         scHeight = Height;
-        scSzMutex.unlock();
-
-        scFbMutex.lock();
         img1 = buff.clone();
-        scFbMutex.unlock();
-
         scFbChangeMutex.lock();
         changeFb = true;
         scFbChangeMutex.unlock();
-
         auto end = std::chrono::system_clock::now();
         std::chrono::duration<double> elapsed_seconds = end - start;
-        gtFrMutex.lock();
         // calculate the required delay for to hit the target frame rate
         float delay = 1000.0 / frameRate - elapsed_seconds.count() * 1000;
-        gtFrMutex.unlock();
         if (delay > 0){
             std::this_thread::sleep_for(std::chrono::milliseconds((int)delay));
         }
         end = std::chrono::system_clock::now();
         elapsed_seconds = end - start;
-        scDtMutex.lock();
         deltaScTime = elapsed_seconds.count() * 1000;
-        scDtMutex.unlock();
     }
 }
 
@@ -191,16 +156,14 @@ void ScreenshotThread()
 std::vector<uint8_t> data_buffer;   // the raw binary frame buffer that will be sent to the display
 std::vector<uint8_t> target_buffer; // the buffer containing the image data that will be converted to raw binary data
 
-std::mutex dispSizeMutex;           // mutex for the display size
 std::mutex scTbMutex;               // mutex for the preview
-std::mutex offsetMutex;             // mutex for the offset
-std::mutex stepMutex;               // mutex for the step
+std::mutex newImgMutex;             // mutex for the new image flag
+std::mutex newDataMutex;            // mutex for the new data flag
 
-Mat img2;
+cv::Mat img2;
 bool newImg = false;
-std::mutex newImgMutex;
 bool newData = false;
-std::mutex newDataMutex;
+
 void ComputeThread(){
     uint size_x = 0;
     uint size_y = 0;
@@ -211,8 +174,7 @@ void ComputeThread(){
     int y_step = 0;
     uint offset_x = 0;
     uint offset_y = 0;
-    Mat buff;
-    // slow this down a bit
+    cv::Mat buff;
     while(true){
         bool changed = false;
         scFbChangeMutex.lock();
@@ -220,29 +182,19 @@ void ComputeThread(){
         changeFb = false;
         scFbChangeMutex.unlock();
         if(changed){
-            dispSizeMutex.lock();
             size_x = x_disp_size;
             size_y = y_disp_size;
-            dispSizeMutex.unlock();
-            scSzMutex.lock();
             Width = scWidth;
             Height = scHeight;
-            scSzMutex.unlock();
-            scFbMutex.lock();
             buff = img1.clone();
-            scFbMutex.unlock();
-            offsetMutex.lock();
             offset_x = x_offset;
             offset_y = y_offset;
-            offsetMutex.unlock();
             if(entireDisp){
                 x_step = Width / size_x;
                 y_step = Height / size_y;
             }else{
-                stepMutex.lock();
                 x_step = global_x_step;
                 y_step = global_y_step;
-                stepMutex.unlock();
                 if(x_step > Width / size_x){
                     x_step = Width / size_x;
                 }
@@ -256,13 +208,10 @@ void ComputeThread(){
             }else{
                 continue;
             }
-            // uint8_t target_buffer [size_x * size_y];
             uint32_t index = 0;
-            
             scTbMutex.lock();
             // define the target buffer size
             target_buffer.resize(size_x * size_y);
-    
             // iterate over each pixel of target display
             for (int y = 0; y < size_y; y++)
             {
@@ -270,15 +219,22 @@ void ComputeThread(){
                 {
                     int big_x = x * x_step + offset_x;
                     int big_y = y * y_step + offset_y;
+                    // if the pixel is out of bounds, set it to black
+                    if(big_x > Width){
+                        big_x = Width;
+                    }
+                    if(big_y > Height){
+                        big_y = Height;
+                    }
+
                     // get the pixel value
-                    Vec4b pixel = buff.at<Vec4b>(big_y, big_x);
+                    cv::Vec4b pixel = buff.at<cv::Vec4b>(big_y, big_x);
                     // pixel[0] B
                     // pixel[1] G
                     // pixel[2] R
                     // calculate and store the average value
                     uint8_t avg = (pixel[0] + pixel[1] + pixel[2]) / 3;
                     target_buffer[index] = avg;
-                    // std::cout << (int)avg << std::endl;
                     // set the pixel value
                     index++;
                 }
@@ -291,20 +247,16 @@ void ComputeThread(){
                 // so if a pixel is > threshold, we set it to 11
                 // if it's threshold/2, we set it to 10
                 // if it's 0, we set it to 00
-
                 // byte structure:
                 // 00 00 00 00 - 1 byte
                 // each collection of 2 bits is a brightness value
                 // 00 = black
                 // 01 = 1 - 50% in our case
                 // 10 || 11 = 2 - 100% in our case
-
                 uchar data[4] = {0};
-                
                 // get the pixel values
                 for(int j = 0; j < 4; j++){
                     uchar buff = target_buffer[i * 4 + j];
-                    //std::cout << (int)buff << " ";
                     if(buff > threshHigh){
                         data[j] = 2;
                     }else if(buff > threshMid){
@@ -314,7 +266,6 @@ void ComputeThread(){
                     } 
                     target_buffer[i * 4 + j] = data[j] * 127;
                 }
-
                 uchar byte = 0;
                 for(int j = 0; j < 4; j++){
                     byte |= data[j] << (6 - j * 2);
@@ -322,7 +273,7 @@ void ComputeThread(){
                 data_buffer[i] = byte;
             }
             // convert the target buffer into a black and white CV2 image
-            img2 = Mat(size_y, size_x, CV_8UC1, &target_buffer[0]);
+            img2 = cv::Mat(size_y, size_x, CV_8UC1, &target_buffer[0]);
             scTbMutex.unlock();
             newDataMutex.lock();
             newData = true;
@@ -335,9 +286,7 @@ void ComputeThread(){
 
 }
 
-
-std::mutex serialDlMutex;
-double deltaSerialTime = 0.0; // time between two screenshots
+double deltaSerialTime = 0.0; // time between two serial frames
 void SerialThread(){
     serialib device;
     auto lastStart = std::chrono::system_clock::now();
@@ -361,17 +310,13 @@ void SerialThread(){
                         device.writeBytes(data.data(), data.size());
                         auto end = std::chrono::system_clock::now();
                         std::chrono::duration<double> elapsed_seconds = end - lastStart;
-                        serialDlMutex.lock();
                         deltaSerialTime = elapsed_seconds.count() * 1000;
-                        serialDlMutex.unlock();
                         lastStart = std::chrono::system_clock::now();
                     }
                     device.flushReceiver();
                 }
             }
         }else{
-            // std::cout << "Failed to open device" << std::endl;
-            // sleep chrono
             std::this_thread::sleep_for(std::chrono::milliseconds(1000));
         }
     }
@@ -381,22 +326,18 @@ uint window_width = 800;
 uint window_height = 600;
 // GUI thread
 GLuint textureID;
-void guiThread()
-{
 
-    Mat img;
+void guiThread(){
+    cv::Mat img;
     static bool first_start = true;
-
     // a FIFO with the last 250 frametimes
     std::deque<double> frametimes;
-
     std::vector<std::uint8_t> Pixels;
-
     glfwSetErrorCallback(glfw_error_callback);
     if (!glfwInit())
         return;
 
-        // Decide GL+GLSL versions
+    // Decide GL+GLSL versions
 #if defined(IMGUI_IMPL_OPENGL_ES2)
     // GL ES 2.0 + GLSL 100
     const char *glsl_version = "#version 100";
@@ -444,7 +385,6 @@ void guiThread()
     ImGui_ImplOpenGL3_Init(glsl_version);
     glewInit();
     // Our state
-    bool show_demo_window = false;
     ImVec4 clear_color = ImVec4(1.0f, 1.0f, 0.0f, 1.00f);
 
     // Main loop
@@ -458,25 +398,12 @@ void guiThread()
 #endif
     {
         // Poll and handle events (inputs, window resize, etc.)
-        // You can read the io.WantCaptureMouse, io.WantCaptureKeyboard flags to tell if dear imgui wants to use your inputs.
-        // - When io.WantCaptureMouse is true, do not dispatch mouse input data to your main application, or clear/overwrite your copy of the mouse data.
-        // - When io.WantCaptureKeyboard is true, do not dispatch keyboard input data to your main application, or clear/overwrite your copy of the keyboard data.
-        // Generally you may always pass all inputs to dear imgui, and hide them from your application based on those two flags.
         glfwPollEvents();
 
         // Start the Dear ImGui frame
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
-
-        // 1. Show the big demo window (Most of the sample code is in ImGui::ShowDemoWindow()! You can browse its code to learn more about Dear ImGui!).
-        if (show_demo_window)
-            ImGui::ShowDemoWindow(&show_demo_window);
-
-        // 2. Show a simple window that we create ourselves. We use a Begin/End pair to create a named window.
-
-        // static float f = 0.0f;
-        // static int counter = 0;
 
         // get glfw window size
         int width, height;
@@ -485,41 +412,38 @@ void guiThread()
         window_height = height;
         if (!first_start)
         {
+            // set our flags
             ImGuiWindowFlags window_flags = 0;
             window_flags |= ImGuiWindowFlags_NoTitleBar;
             window_flags |= ImGuiWindowFlags_NoResize;
             window_flags |= ImGuiWindowFlags_NoMove;
             window_flags |= ImGuiWindowFlags_NoScrollbar;
 
-            ImGui::Begin("EL STREAMER", NULL, window_flags);                       // Create a window called "Hello, world!" and append into it.
+            ImGui::Begin("EL STREAMER", NULL, window_flags);
             ImGui::SetWindowSize(ImVec2(window_width, window_height));
             ImGui::SetWindowPos(ImVec2(0, 0));
-            ImGui::Text("Welcome to EL Streamer");             // Display some text (you can use a format strings too)
-            ImGui::Checkbox("Demo Window", &show_demo_window); // Edit bools storing our window open/close state
-            ImGui::ColorEdit3("Color", (float *)&clear_color); // Edit 3 floats representing a color
+            ImGui::ColorEdit3("Color", (float *)&clear_color);
             ImGui::SliderInt("High Threshold", &threshHigh, 0, 255);
             ImGui::SliderInt("Mid Threshold", &threshMid, 0, 255);
             
             if(!entireDisp){
-                offsetMutex.lock();
-                dispSizeMutex.lock();
-                stepMutex.lock();
-                ImGui::SliderInt("Offset X", &x_offset, 0, monitor_width - x_disp_size);
-                ImGui::SliderInt("Offset Y", &y_offset, 0, monitor_height - y_disp_size);
+                // calculate the maximum offset for the sliders, taking the step size into account
+                int max_x_offset = (monitor_width - x_disp_size * global_x_step);
+                int max_y_offset = (monitor_height - y_disp_size * global_y_step);
+                ImGui::SliderInt("Offset X", &x_offset, 0, max_x_offset);
+                ImGui::SliderInt("Offset Y", &y_offset, 0, max_y_offset);
                 ImGui::SliderInt("Step X", &global_x_step, 1, monitor_width / x_disp_size);
                 ImGui::SliderInt("Step Y", &global_y_step, 1, monitor_height / y_disp_size);
-                stepMutex.unlock();
-                dispSizeMutex.unlock();
-                offsetMutex.unlock();
+                if(x_offset > max_x_offset){
+                    x_offset = max_x_offset;
+                }
+                if(y_offset > max_y_offset){
+                    y_offset = max_y_offset;
+                }
             }
-            // if (ImGui::Button("Button"))                            // Buttons return true when clicked (most widgets return true when edited/activated)
-            //     counter++;
-            // ImGui::SameLine();
-            // ImGui::Text("counter = %d", counter);
+
             float frameTime = 1000.0f / io.Framerate;
-            gtFrMutex.lock();
             frameRate = io.Framerate;
-            gtFrMutex.unlock();
             // add frame time to the vector and if it's too big, remove the first element
             frametimes.push_back(frameTime);
             if (frametimes.size() > 250)
@@ -540,49 +464,24 @@ void guiThread()
                 }
             }
             double scTime = 0;
-            scDtMutex.lock();
             scTime = deltaScTime;
-            scDtMutex.unlock();
             double serialTime = 0;
-            serialDlMutex.lock();
             serialTime = deltaSerialTime;
-            serialDlMutex.unlock();
+            // show the frame time and FPS
             ImGui::Text("Application average %.3f ms/frame (%.1f FPS); Screenshot thread: %.3f ms/frame; Serial thread: %.3f ms", frameTime, io.Framerate, scTime, serialTime);
             ImGui::PlotLines("##Frame Time Graph", arrFrameTimes, IM_ARRAYSIZE(arrFrameTimes), 0, NULL, 0, maxFrameTime, ImVec2(window_width, 80));
 
-            // ImageFromDisplay(Pixels, Width, Height, Bpp);
-            // img1 = Mat(Height, Width, Bpp > 24 ? CV_8UC4 : CV_8UC3, &Pixels[0]);
-
             bool bufferChanged = false;
-
-            // scFbChangeMutex.lock();
-            // bufferChanged = changeFb;
-            // changeFb = false;
-            // scFbChangeMutex.unlock();
-
-
             newImgMutex.lock();
             bufferChanged = newImg;
             newImg = false;
             newImgMutex.unlock();
-
-    
-
-
             if (bufferChanged)
             {
-                // scFbMutex.lock();
-                // img = img1.clone();
-                // scFbMutex.unlock();
-                // cvtColor(img, img, cv::COLOR_BGR2RGB);
-
                 scTbMutex.lock();
                 img = img2.clone();
                 scTbMutex.unlock();
-
-                // convert the icvtColor(img, img, cv::COLOR_BGR2RGB);mg cvtColor(img, img, cv::COLOR_BGR2RGB);buffer from CV_8UC1 to RGB
                 cv::cvtColor(img, img, cv::COLOR_GRAY2RGB);
-
                 // multiply each pixel by respective clear_color value
                 for (int i = 0; i < img.rows; i++)
                 {
@@ -593,14 +492,14 @@ void guiThread()
                         img.at<cv::Vec3b>(i, j)[2] = img.at<cv::Vec3b>(i, j)[2] * clear_color.z;
                     }
                 }
-
+                // create a texture from the image
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, img.cols, img.rows, 0, GL_RGB, GL_UNSIGNED_BYTE, img.ptr());
-                // glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, x_size, y_size, 0, GL_RGB, GL_UNSIGNED_BYTE, img.ptr());
             }
+            // display the image
             ImGui::Image((void *)(intptr_t)textureID, ImVec2(img.cols, img.rows));
             ImGui::End();
             // se the background color to white
@@ -631,18 +530,14 @@ void guiThread()
             if(y_size % 4 != 0){
                 y_size = y_size - (y_size % 4);
             }
-
-            dispSizeMutex.lock();
             x_disp_size = x_size;
             y_disp_size = y_size;
-            dispSizeMutex.unlock();
             ImGui::Text("Should the stream be fullscreen?");
             ImGui::Checkbox("Fullscreen", &entireDisp);
 
             static char* items[99] = {0};
             static int item_current = -1; // If the selection isn't within 0..count, Combo won't display a preview
             ImGui::PushItemWidth(150);
-            // ImGui::Combo("##PortSelector", &item_current, items, IM_ARRAYSIZE(items));
             if (ImGui::BeginCombo("##PortSelector", selected_port))
             {
                 for (int n = 0; n < IM_ARRAYSIZE(items); n++)
@@ -653,7 +548,6 @@ void guiThread()
                             item_current = n;
                             strcpy(selected_port, items[n]);
                         }
-                    
                         // Set the initial focus when opening the combo (scrolling + keyboard navigation focus)
                         if (is_selected){
                             ImGui::SetItemDefaultFocus();
@@ -662,7 +556,6 @@ void guiThread()
                 }
                 ImGui::EndCombo();
             }
-            //std::cout << selected_port << std::endl;
 
             ImGui::SameLine();
 
@@ -677,16 +570,13 @@ void guiThread()
                     #if defined (_WIN32) || defined( _WIN64)
                         sprintf (device_name[i],"\\\\.\\COM%d",i+1);
                     #endif
-
                     // Prepare the port name (Linux)
                     #ifdef __linux__
                         sprintf (device_name[i],"/dev/ttyACM%d",i);
                     #endif
-
                     // try to connect to the device
                     if (device.openDevice(device_name[i],115200)==1)
                     {
-                        // printf ("Device detected on %s\n", device_name[i]);
                         // set the pointer to the array
                         items[i] = device_name[i];
                         // Close the device before testing the next port
@@ -696,31 +586,22 @@ void guiThread()
                     }
                 }
             }
-
             scan = ImGui::Button("Scan", ImVec2(100, 20));
-
             // center the button
             ImGui::SetCursorPosX((300-100)/2);
             ImGui::SetCursorPosY(150);
             first_start = !ImGui::Button("Apply", ImVec2(100, 20));
-            
             ImGui::End();
-
         }
-
         // Rendering
         ImGui::Render();
         int display_w, display_h;
         glfwGetFramebufferSize(window, &display_w, &display_h);
         glViewport(0, 0, display_w, display_h);
-        //glClearColor(clear_color.x * clear_color.w, clear_color.y * clear_color.w, clear_color.z * clear_color.w, clear_color.w);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
         glfwSwapBuffers(window);
-
-        // wait 10ms blocking
-        // std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 #ifdef __EMSCRIPTEN__
     EMSCRIPTEN_MAINLOOP_END;
@@ -739,45 +620,22 @@ void guiThread()
 
 int main(int, char **)
 {
-
-    /////////////////////////  OPENCV SCREENSHOT  /////////////////////////
     int Width = 0;
     int Height = 0;
-    int Bpp = 0;
-    std::vector<std::uint8_t> Pixels;
-
-    ImageFromDisplay(Pixels, Width, Height, Bpp);
-
+    getSize(Width, Height);
     monitor_width = Width;
     monitor_height = Height;
 
-    img1 = Mat(Height, Width, Bpp > 24 ? CV_8UC4 : CV_8UC3, &Pixels[0]); // Mat(Size(Height, Width), Bpp > 24 ? CV_8UC4 : CV_8UC3, &Pixels[0]);
-    // namedWindow("WindowTitle", WINDOW_AUTOSIZE);
-    // imshow("Display window", img1);
-    // waitKey(0);
-
-    // cv::cvtColor(img1, img, cv::COLOR_BGR2RGB);
-    // // create a texture
-
-    glGenTextures(1, &textureID);
-    glBindTexture(GL_TEXTURE_2D, textureID);
-
-    // return 0;
-    /////////////////////////  OPENCV SCREENSHOT END  /////////////////////////
-
     // start the screenshot thread
     std::thread screenshotThread(ScreenshotThread);
-
     // start the compute thread
     std::thread computeThread(ComputeThread);
-
     // start the serial stream thread
     std::thread serialThread(SerialThread);
-
     // start the imgui thread
     std::thread imguiThread(guiThread);
 
-    // wait for the threads to finish
-    // screenshotThread.join();
+    // wait for the threads to finish (which they never do unless the program is closed)
     imguiThread.join();
+    return 0;
 }
